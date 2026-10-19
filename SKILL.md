@@ -74,20 +74,54 @@ grep -n "^from\|^import" .../models/<arch>/modeling_<arch>.py   # 依赖面 = �
 
 ---
 
-## 2. 抽取策略：两条路，选一条
+## 2. 抽取方式：最大限度复用 transformers 的实现
 
-**A. 重写（推荐给"要读懂/要改"的场景）**
-参考实现只当规范读。优点是干净、可控、单文件；缺点是要逐行对照。
-多模态模型基本只能走这条（依赖面太大：masking_utils、cache_utils、rope_utils、
-generation、integrations…）。
+原则：**以 transformers 的对应代码为蓝本，能搬就搬，只做"去依赖 + 去分支"的删减，不要凭理解重写。**
 
-**B. 搬运 + 打桩（推荐给"只是想去掉依赖"的场景）**
-把 `modeling_<arch>.py` 复制出来，重写 `from ...x import y`：
-- 能一行顶掉的（`ACT2FN`、`PreTrainedModel`、`ModelOutput`）→ 写进 `_compat.py`
-- 复杂子系统（`masking_utils`、`cache_utils`、`modeling_rope_utils`）→ 按需**裁剪**成 50~200 行，
-  只保留本架构实际走到的分支
-判别标准：`grep -n "^from \.\." modeling_<arch>.py` 数一下有多少个不同的子系统。
->3 个就建议走 A。
+- 搬的是**源码**，不是运行时依赖：代码进你的文件，产物依然不 import transformers。
+- 搬进来的部分保留原来的算子顺序、dtype、mask 取值、norm 位置 —— 这些细节最容易被"我觉得应该这样"改错。
+- 只有三类东西需要自己写：config dataclass、权重加载器、把各部件串起来的接口（forward 的胶水）。
+
+### 2.1 先列依赖面：决定搬哪些代码
+
+```bash
+grep -n "^from \.\|^import" modeling_<arch>.py   # 依赖面 = 要搬的源文件清单
+grep -n "^class \|^def " modeling_<arch>.py      # 结构总览：类层次 + forward 链
+```
+
+| 依赖 | 搬法 |
+|---|---|
+| 工具件（用到的激活函数、`ModelOutput`、日志）| 搬用到的那个函数/表项；`ModelOutput` 用 `dataclass` 顶掉 |
+| 计算子系统（mask、rope、cache、attention、generation）| 把对应文件里的相关函数整段搬进来，删掉本架构走不到的分支，通常剩 50~200 行 |
+| 预处理（image processor / feature extractor / tokenizer）| 搬 `image_processing_*.py` / `feature_extraction_*.py` 的实现，剥掉 `ProcessorMixin` 外壳；tokenizer 用 `tokenizers` 直接加载仓库里的 `tokenizer.json` |
+
+按"最小闭包"搬：缺哪个函数补哪个，只搬 forward 真正用到的部分，但搬到的部分逐行保留原样。
+
+### 2.2 定点读：只读要搬的那几段
+
+- **从 `__init__` 对结构**：照着权重文件的索引（`peek_checkpoint.py --list`）逐个核对 submodule
+  名，对不上就是漏了层或写错了名。
+- **从 `forward` 追调用**：只沿 `forward` 实际走到的路径往下，`generate()`、训练脚本、
+  `prepare_inputs_for_generation` 不看。
+- **遇到 `if` 按当前 config 定值**：只搬这个配置走的分支，另一条在注释里写一句"若有 X 则……"，
+  方便以后改。
+
+### 2.3 落笔规则
+
+1. **保留命名**：类名 / 属性名 / 参数名逐字一致，这是加载官方权重的前提。
+2. **保留实现细节**：算子顺序、dtype、mask 取值、池化边界照搬，不顺手"优化"。想改进，等数字对上之后再单独改。
+3. **只删外壳，不动计算**：backend 分派收成一条自己看得懂的 attention 路径；`Cache` 换成最小的
+   `KVCache`；`**kwargs` 展开成具名参数。
+4. **标注出处**：文件头写清搬自哪个 transformers 版本、哪个文件，后面改动才好回溯。
+
+### 2.4 收尾自检
+
+```bash
+grep -rn "import transformers\|from transformers" modeling_<arch>.py preprocessing.py   # 必须为空
+```
+
+再抽查两处：随便挑 forward 里的一个张量，能不能说出它的 shape 和来源？随便挑一个搬来的函数，
+能不能指出参考实现里的对应位置？
 
 ---
 
@@ -190,24 +224,61 @@ batch shape 也不同，归约顺序变了。把第一项单独测，就是为�
 
 ---
 
-## 6. 常见坑（移植时高频出现）
+## 6. 出现数值差异时怎么查
 
-| 坑 | 症状 | 处理 |
-|---|---|---|
-| **参考按 `config.dtype` 加载 bf16** | 第一层就有 1e-2 差异，逐层放大，fp32 下本该 0.0 | 参考显式传 `dtype=torch.float32`，或自己传 `dtype="auto"`；先看 `next(ref.parameters()).dtype` |
-| **`inv_freq` 注册成 buffer** | fp32 下 0.0，bf16 下第一层就差 1e-2；`cos` 逐位对、`sin` 差 1 ulp | `.to(bf16)` 会舍入所有浮点 buffer（`bf16(0.1)=0.10009765625`）。改成普通属性存 fp32，forward 里再 upcast |
-| `config.to_dict()` 丢掉派生字段 | tiny 配置里 full-attention 层 head_dim 变成默认值 | 导出 tiny 配置后手动补回（`--set text_config.<field>=...`） |
-| `per_layer_config` 让 `config.head_dim` 抛异常 | `AmbiguousGlobalPerLayerAttributeError` | 用 `config.per_layer_config[i].head_dim`，或自己在 config 里写 `layer_head_dim(i)` |
-| eager 下音频 mask 语义反了 | 音频输出差 1e-1 且怎么调都不收敛 | 某些实现的 `masked_fill(mask.logical_not(), ...)` 期望 bool mask，eager 给 float → 退化为均匀注意力。**对齐时换 `attn_implementation` 试** |
-| 同一份 embedding 被投影两次 | 每层 hidden 差 1e-2，logits 差 5e-2 | 投影只在内层做一次，外层只传 raw embedding |
-| 左 padding 的 loss | loss 差 3e-2，logits 只在有效位对上 | 第一个真实 token 由"全屏蔽行"预测，label 要一起忽略 |
-| 位置表 buffer 初始化成 `ones` | 不报错，但输出不对 | 先查 `__init__` 的初值，别随手 `torch.empty` |
-| sliding window 边界 | 只在长序列时错 | 语义是 `kv_idx > q_idx - w`（含自身，窗口宽 w） |
-| **decode 时 mask 没做位置偏移** | 短序列正常，超过窗口就全乱 | q 的绝对位置是 `kv_len - q_len`，不是 0 |
-| **共享层读到半截 k/v** | 只有解码长度超过 prefill 时才错 | `store_full_length_kv` 必须在 `cache.update()` 之后写 |
-| 视觉 patch 顺序 | 图看起来对但差 1e-2 | patch 内通道放最后一维，与 `Linear(C*P*P, hidden)` 对应 |
+每个模型的具体问题都不一样，所以这里不列具体案例，只给一套定位方法：**每一步都先确认两边
+的输入相同，再把范围缩小一半。** 顺序不要跳。
 
-完整清单：`references/pitfalls.md`。
+### ① 先排除假差异
+
+在怀疑自己的实现之前，确认两边算的是同一件事：
+
+- **dtype**：`from_pretrained()` 默认按参考 config 里的精度加载，先打 `next(ref.parameters()).dtype`
+- **attention 实现**：eager / sdpa / flash 的归约顺序不同，1e-7 量级是正常的
+- **模式**：`model.eval()` + `torch.no_grad()`，别让 dropout 参与
+- **输入**：同一份 `input_ids` / `attention_mask`；`position_ids` 是参考自己算的还是你传的
+- **设备**：CPU 与 GPU 的 kernel 不同，先在同一设备上比完再谈别的
+
+### ② 从最前面开始，逐段二分
+
+固定顺序：**预处理 → embedding → 第 1 层 → 前几层 → 全部层 → logits → loss**。
+找到第一个"输入相同、输出不同"的模块，问题就在它内部；它之后的所有差异都是这一处的后果。
+
+用 forward hook 抓中间量，两边注册同样的 hook：
+
+```python
+buf = {}
+def hook(name):
+    def fn(module, inp, out):
+        buf[name] = (out[0] if isinstance(out, tuple) else out).detach()
+    return fn
+```
+
+### ③ 一层内部还看不出，就继续往下钻
+
+- 整层输出有差异 → hook 该层的子模块（attn / mlp / norm），继续二分
+- 子模块也一致 → 差异在没被 hook 的中间量：q/k/v、rope 的 cos/sin、mask 本身、池化后的 token
+- 还不够细 → 拦截算子（`torch.matmul`、`F.softmax`），给每次输出打个 checksum，
+  **第一个对不上的算子**就是出事的地方
+
+### ④ 按差异的形态判断方向
+
+| 现象 | 大概率原因 |
+|---|---|
+| 1e-7 量级、只出现在 logits | 不同 attention backend 的归约顺序，正常 |
+| fp32 下本该 0.0，却稳定在 1e-3 | 语义写错了（mask 取值、rope 拼法、投影次数），别用容差掩盖 |
+| 第一层就差、之后一路放大 | 精度问题：浮点 buffer 被 `.to()` 舍入、参考按 bf16 加载、初始化值不同 |
+| 前几层 0.0，某一层突然起跳 | 该层独有的逻辑：异构 head_dim、共享 KV 取错层、逐层缩放系数 |
+| 只在长序列错 | 窗口 / 分块注意力的边界（窗口宽度、是否含自身） |
+| 只在有 padding 时错 | mask 方向、有限负值；padded 行的输出本来就未定义 |
+| 只在带 cache 解码时错 | query 位置偏移、cache 更新顺序、mask 没覆盖全长 |
+| 只在某一种模态错 | 该模态的预处理或池化，不是语言塔的问题 |
+| 怎么调都差 1e-1，且不随层数收敛 | 先怀疑参考实现自己在当前 backend 下的分支，换 `attn_implementation` 再试 |
+
+### ⑤ 收尾
+
+- 容差写进交付文档：哪一项、差多少、为什么。
+- 每个修好的差异都补一条测试，防止以后改架构时复发。
 
 ---
 

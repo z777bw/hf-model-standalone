@@ -122,7 +122,7 @@ GEMMA4_CKPT=/data/models/gemma-4-E2B python examples/gemma4_standalone/test_pari
 fp32 下 ~1e-6 就是算术噪声；**1e-2 才是 bug**（位置偏移错、共享层取错层）。
 把"`use_cache` 开/关的整段前向"单独测成 0.0，就是为了把这两件事区分开。
 
-三个必须知道的参考实现细节（测试里已处理，详见 [`references/pitfalls.md`](../../references/pitfalls.md)）：
+三个必须知道的参考实现细节（测试里已处理）：
 
 1. `config.to_dict()` 会把 `global_head_dim` 吞进 `per_layer_config` 而丢失 —— 官方
    checkpoint 的 `config.json` 是带这个字段的，导出 tiny 配置时要手动补回去。

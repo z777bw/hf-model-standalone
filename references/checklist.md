@@ -5,7 +5,7 @@
 ## 0. 前置
 
 - [ ] 网络自检：能连 `huggingface.co` 吗？不能就 `--endpoint https://hf-mirror.com`；
-      报 `502 Bad Gateway` 是本地代理问题，加 `--no-proxy`（见 pitfalls G1）
+      报 `502 Bad Gateway` 是本地代理问题，加 `--no-proxy`（`scripts/hf_net.py` 会直接给出诊断）
 - [ ] `config.json` 里的 `architectures[0]` → 要移植的类名
 - [ ] `model_type` → 源码目录 `transformers/models/<model_type>/`
 - [ ] 是否 `trust_remote_code`（有 `modeling_*.py` 在仓库里 → 以仓库代码为准，不是 site-packages）
@@ -81,7 +81,8 @@
 - [ ] 加载 tiny ckpt：missing/unexpected 为空
 - [ ] 预处理逐项对齐（ids / pixel_values / input_features）
 - [ ] 逐层 hidden → logits → loss 对齐（见 `parity.md`）
-- [ ] bf16 下再比一次（fp32 逐位相同 ≠ bf16 也相同，见 pitfalls B5）
+- [ ] bf16 下再比一次（fp32 逐位相同 ≠ bf16 也相同：`model.to(bf16)` 会舍入浮点 buffer，
+      比如 rope 用的 `inv_freq`）
 - [ ] 交付 README 里写清：覆盖范围、未覆盖范围、逐项 diff 表、已知参考实现问题
 
 ## 8. 不要做的

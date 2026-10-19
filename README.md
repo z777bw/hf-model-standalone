@@ -157,9 +157,8 @@ python scripts/make_tiny_reference.py ./ckpt --out ./tiny_ckpt
 
 ```text
 hf-model-standalone/
-├── SKILL.md                  # agent 入口：工作流、抽取路线、权重加载、KV cache、坑表
+├── SKILL.md                  # agent 入口：工作流、抽取路线、权重加载、KV cache、数值差异排查
 ├── references/
-│   ├── pitfalls.md           # A~G 七组坑位，★ 标注实测踩过的
 │   ├── parity.md             # 数值对齐手册（含算子级定位法）
 │   └── checklist.md          # 逐项打勾清单（配置 → 参数名 → forward → 预处理 → 权重 → cache）
 ├── scripts/

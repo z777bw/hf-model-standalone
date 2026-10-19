@@ -17,7 +17,7 @@ path feeds an additive 0/-inf mask into `Gemma4AudioAttention`, which does
 `masked_fill(mask.logical_not(), -1e9)` and therefore overwrites every *allowed*
 logit with -1e9 -- the encoder degenerates to uniform attention over the local
 window. sdpa receives a boolean mask and behaves as intended, so that is what we
-match. See references/pitfalls.md.
+match. See the example README for details.
 
 Run:
     python examples/gemma4_standalone/test_parity.py     # from the repo root

@@ -87,7 +87,7 @@ torch.matmul = patched      # 同样可以包 F.softmax
 | --- | --- |
 | 1e-7 量级 | 只是 sdpa/eager 的归约顺序差异，可以接受 |
 | 1e-3~1e-2，且**第一层就有**、逐层继续放大 | 先查 dtype 是否统一（参考默认吃 `config.dtype`）；确认统一后再怀疑 rope/mask |
-| fp32 下 0.0、bf16 下第一层就差 1e-2，`cos` 逐位对但 `sin` 差 1 ulp | `inv_freq` 被注册成 buffer，`.to(bf16)` 把它舍入了（见 pitfalls B5）；改成普通属性存 fp32 |
+| fp32 下 0.0、bf16 下第一层就差 1e-2，`cos` 逐位对但 `sin` 差 1 ulp | `inv_freq` 被注册成 buffer，`.to(bf16)` 把它舍入了（`bf16(0.1)=0.10009765625`）；改成普通属性存 fp32，forward 里再 upcast |
 | 1e-3~1e-2，前几层为 0、某一层才起跳 | rope（theta/partial/proportional 的 inv_freq 拼法）、mask 边界差 1 |
 | 只在长序列错 | sliding window 语义 / chunked attention 的 context 宽度 |
 | 只在有 padding 时错 | mask 是否作用到 key 侧、是否用有限最小值 |
