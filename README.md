@@ -118,7 +118,7 @@ pip install transformers
 
 agent 会按固定顺序推进，你也可以按这个顺序自己手动做：
 
-1. 📥 只拉 `config.json` 和预处理器（几 MB～几十 MB），**绝不下载权重**
+1. 📥 只拉 `config.json` 和预处理器（几 MB～几十 MB），**不下载权重**
 2. 🔍 花几秒钟读一下权重文件的索引（只读文件开头，不下载权重），拿到每个参数的名字 / 形状 / 精度
 3. 🏗️ 照官方的参数名写 `modeling_<arch>.py`（单文件）+ `preprocessing.py`
 4. 🧪 造一个缩小版模型，逐层对比中间结果和最终输出
@@ -137,10 +137,6 @@ python scripts/peek_checkpoint.py google/gemma-4-E2B
 # ③ 造一个 1 MB 的缩小版模型（结构开关全保留）
 python scripts/make_tiny_reference.py ./ckpt --out ./tiny_ckpt
 ```
-
-> 🌐 内地网络：`502 Bad Gateway` 基本都是本地代理拒绝隧道，不是网站挂了。
-> 加 `--endpoint https://hf-mirror.com --no-proxy`，或 `export HF_ENDPOINT=https://hf-mirror.com`。
-> 三个脚本都接受**本地路径**，断网也能核对参数名、造缩小版模型。
 
 ### 交付产物目录
 
