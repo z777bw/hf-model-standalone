@@ -75,7 +75,7 @@ flowchart TB
 ## 快速开始
 
 ```bash
-git clone https://github.com/<you>/hf-model-standalone
+git clone https://github.com/z777bw/hf-model-standalone
 cd hf-model-standalone
 ```
 
@@ -170,10 +170,10 @@ python examples/run_gemma4_e2b.py --model-dir /data/models/gemma-4-E2B --compare
 
 ```bash
 # Claude Code
-git clone https://github.com/<you>/hf-model-standalone ~/.claude/skills/hf-model-standalone
+git clone https://github.com/z777bw/hf-model-standalone ~/.claude/skills/hf-model-standalone
 
 # WorkBuddy
-git clone https://github.com/<you>/hf-model-standalone ~/.workbuddy/skills/hf-model-standalone
+git clone https://github.com/z777bw/hf-model-standalone ~/.workbuddy/skills/hf-model-standalone
 ```
 
 之后说"把 Qwen3 从 transformers 里抽出来"之类的话，agent 会自动加载 `SKILL.md` 并按流程走。
