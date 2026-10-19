@@ -8,6 +8,8 @@ Strategy (no 10 GB download, no GPU):
   3. export its state_dict to a real `model.safetensors` + `config.json`
   4. load that checkpoint with `gemma4_standalone.load_gemma4_from_safetensors`
   5. compare logits / loss / pixel_values / input_features / token ids
+  6. decode the same sequence incrementally through the KV cache, and compare
+     greedy generation against the reference `generate()`
 
 The text+vision suite runs against the reference's **eager** attention path
 (bit-exact there). The audio suite runs against **sdpa**: the reference's eager
