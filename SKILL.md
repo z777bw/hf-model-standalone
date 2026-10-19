@@ -220,7 +220,8 @@ batch shape 也不同，归约顺序变了。把第一项单独测，就是为�
 ├── kv_cache.py           # 增量解码：最小 K/V 存储（可替换为 static / quantized）
 ├── generation.py         # prefill / decode_step / generate
 ├── README.md             # 覆盖范围 + 未覆盖范围 + 实测 diff 表
-└── tests/test_parity.py  # tiny 参考模型对齐 + cache 一致性
+├── test_parity.py        # tiny 参考模型对齐 + cache 一致性
+└── run_<arch>.py         # 真实权重的前向 / loss / 生成 demo
 ```
 
 模型代码坚持一个文件：多模态模型动辄 3000 行，拆成 20 个模块后"和参考实现对拍"会变成
