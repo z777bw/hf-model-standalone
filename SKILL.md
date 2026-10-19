@@ -187,3 +187,6 @@ for shard in shards:                       # 单文件或 index.json 的 weight_
 它包含三个参考实现自身的坑（`global_head_dim` 被 `per_layer_config` 吞掉、eager 音频 mask
 类型、`inv_freq` 被 bf16 舍入），以及"dtype 不一致导致 1e-2 假差异"的完整排查过程，
 都记录在 `references/pitfalls.md`。改造新模型时，先照着这份案例的目录结构摆。
+
+> 若这个 skill 是单独安装的、没有 `examples/` 目录（例如只拷了 `SKILL.md` + `references/`
+> + `scripts/`），按第 1~5 节自己造一个案例即可；案例不是运行依赖，只是参照物。
