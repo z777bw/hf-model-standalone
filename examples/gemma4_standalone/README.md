@@ -7,6 +7,8 @@
 examples/gemma4_standalone/
 ├── modeling_gemma4.py   ← 模型全部代码（单文件）：config 树 + 所有 nn.Module + forward/loss + 权重加载
 ├── preprocessing.py     ← 输入预处理：tokenizer / 图像处理 / 音频 log-mel / processor 拼装
+├── kv_cache.py          ← 增量解码：每层一对 (k, v)，append + crop + reorder
+├── generation.py        ← prefill / decode_step / sample / generate
 ├── __init__.py
 └── test_parity.py       ← 与 transformers 的数值对齐测试（tiny 随机权重，CPU，秒级）
 
@@ -28,8 +30,10 @@ examples/run_gemma4_e2b.py  ← 真实 10GB 权重的前向 + loss 示例（在�
 | 融合 | `<|image|>` / `<|audio|>` 占位符被 soft token `masked_scatter` 替换；PLE 在替换前用 pad embedding 计算 |
 | 头/损失 | `tanh` logit soft-capping(30) + 移位交叉熵（`-100` 忽略） |
 | 权重 | 单文件/分片 safetensors、tied `lm_head`、丢弃 KV 共享层里多余的 k/v、dtype 转换 |
+| 增量解码 | `KVCache`（append 式）+ `prefill` / `decode_step` / `generate`；支持 greedy / temperature / top-k / top-p |
 
-未覆盖：KV cache / 生成循环（`use_cache`）。前向与 loss 是完整的。
+未覆盖：beam search、静态预分配 cache、KV cache 量化、多卡与 CUDA graph。
+`use_cache` 默认关闭，纯前向路径不受影响。
 
 ---
 
@@ -54,6 +58,25 @@ print(out.logits.shape, out.loss.item())
 
 纯文本 / 纯音频同理，`input_features` + `input_features_mask` 走音频塔。
 
+### 增量解码
+
+```python
+from gemma4_standalone import generate
+
+new_ids = generate(
+    model, batch["input_ids"], max_new_tokens=32, do_sample=False,
+    eos_token_id=[proc.tokenizer.eos_token_id],
+    # 多模态输入只喂给 prefill；decode 阶段不会再跑视觉塔
+    pixel_values=batch["pixel_values"],
+    image_position_ids=batch["image_position_ids"],
+)
+print(proc.tokenizer.decode(new_ids[0, batch["input_ids"].shape[1]:]))
+```
+
+`generate` 就是 `prefill`（一整段 prompt 一次前向，填满 cache）+ 循环 `decode_step`
+（每次一个 token，只算它的 query）。`kv_cache.py` 是一个"每层一对 tensor、沿 seq 维
+`cat`"的最小实现 —— 故意写得能一眼看完，方便你换成 static cache / 量化 cache / beam search。
+
 ---
 
 ## 验证（`tests/test_parity.py`）
@@ -65,7 +88,7 @@ chunked 音频注意力），随机初始化，导出成真的 `model.safetensor
 ```
 $ python examples/gemma4_standalone/test_parity.py     # 仓库根目录下执行
 ...
-RESULT: 35/35 checks passed
+RESULT: 46/46 checks passed
 ```
 
 其中 tokenizer 那几项需要真实的 `tokenizer.json`（约 31 MB，不含权重）：
@@ -76,7 +99,7 @@ python scripts/fetch_minimal.py google/gemma-4-E2B --out ./ckpt
 GEMMA4_CKPT=/data/models/gemma-4-E2B python examples/gemma4_standalone/test_parity.py
 ```
 
-没有的话这几项会打印 `[skip]` 并从计数里剔除，其余 31 项照常跑。
+没有的话这几项会打印 `[skip]` 并从计数里剔除，其余 42 项照常跑。
 
 实测结果：
 
@@ -90,6 +113,14 @@ GEMMA4_CKPT=/data/models/gemma-4-E2B python examples/gemma4_standalone/test_pari
 | 音频 + 文本 / 图像+音频+文本（sdpa 参考） | ≤ 5.6e-7 |
 | 权重加载：missing/unexpected/dropped | 0 / 0 / 6（丢弃 KV 共享层的冗余 k/v） |
 | `dtype="auto"` 读 bf16 checkpoint vs `from_pretrained` 的 bf16 参考 | **0.0** |
+| `use_cache=True` vs `False` 的整段前向（隔离 cache 本身） | **0.0** |
+| 增量 decode 拼接 vs 一次全序列 forward（12 token > sliding window 8） | 9.09e-7 / 8.35e-7 |
+| greedy 生成的 token ids vs `model.generate()` | 完全一致 |
+
+**为什么"增量 vs 全量"不是 0？** 两者数学上等价，但 softmax 分母的求和项数不同
+（prefill 时一次算 6 项，decode 时算 12 项），matmul 的 batch shape 也不同，归约顺序变了。
+fp32 下 ~1e-6 就是算术噪声；**1e-2 才是 bug**（位置偏移错、共享层取错层）。
+把"`use_cache` 开/关的整段前向"单独测成 0.0，就是为了把这两件事区分开。
 
 三个必须知道的参考实现细节（测试里已处理，详见 [`references/pitfalls.md`](../../references/pitfalls.md)）：
 

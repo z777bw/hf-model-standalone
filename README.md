@@ -10,8 +10,9 @@
   <img alt="PyTorch" src="https://img.shields.io/badge/pytorch-2.0%2B-orange.svg">
 </p>
 
-已验证案例：`google/gemma-4-E2B`（5.1B，文本 + 视觉 + 音频）—— 35/35 项数值检查通过，
-文本塔与视觉塔在 fp32 下 **logits diff = 0.0（逐位相同）**。
+已验证案例：`google/gemma-4-E2B`（5.1B，文本 + 视觉 + 音频）—— 46/46 项数值检查通过，
+文本塔与视觉塔在 fp32 下 **logits diff = 0.0（逐位相同）**，greedy 生成的 token 与官方
+`generate()` 完全一致。
 
 ---
 
@@ -126,6 +127,28 @@ export HF_ENDPOINT=https://hf-mirror.com     # 给 transformers / hf_hub 用
 
 验证标准只有一条：**`report["missing"] == [] and report["unexpected"] == []`**。
 
+## 推理：KV cache + 生成循环
+
+抽出来的东西不该只能算 loss。`kv_cache.py` 和 `generation.py` 给了一个能读完、能替换的增量解码：
+
+```python
+from gemma4_standalone import generate
+
+ids = generate(
+    model, batch["input_ids"], max_new_tokens=32, do_sample=False,
+    eos_token_id=[proc.tokenizer.eos_token_id],
+    pixel_values=batch["pixel_values"],          # 只喂给 prefill
+    image_position_ids=batch["image_position_ids"],
+)
+```
+
+prefill 一次填满 cache，然后每次只算一个新 token 的 query。cache 就是"每层一对 `(k, v)`，
+沿 seq 维 `cat`" —— 故意不优化，让你能一眼看完，然后把 `torch.cat` 换成预分配 buffer、
+把 dynamic cache 换成 static cache、把 greedy 换成 beam search。
+
+有三个坑只在接 cache 的时候才暴露：decode 时 query 的绝对位置是 `kv_len - q_len`（不是 0），
+KV 共享层不写 cache 而是从共享字典读，`attention_mask` 必须覆盖全长而不是只传新 token。
+
 ## 已验证：Gemma 4
 
 `examples/gemma4_standalone/` —— 从 transformers v5.16.1 逐行移植，运行时不 import transformers。
@@ -139,6 +162,9 @@ export HF_ENDPOINT=https://hf-mirror.com     # 给 transformers / hf_hub 用
 | 图像 + 文本 logits + loss | **0.0** |
 | 音频 + 文本、图像 + 音频 + 文本 | ≤ 5.6e-7 |
 | 权重加载 missing / unexpected / dropped | 0 / 0 / 6 |
+| `use_cache=True` vs `False` 的整段前向 | **0.0** |
+| 增量 decode vs 一次全序列 forward | 9.09e-7 |
+| greedy 生成 token ids vs 官方 `generate()` | 完全一致 |
 
 ```bash
 python examples/gemma4_standalone/test_parity.py     # ~30 s，CPU
@@ -193,7 +219,7 @@ hf-model-standalone/
 │   ├── peek_checkpoint.py    # HTTP Range 读 safetensors header，不下载权重
 │   └── make_tiny_reference.py# 缩维造 tiny 参考模型
 └── examples/
-    ├── gemma4_standalone/    # 完整案例：1575 行单文件实现 + 预处理 + 对齐测试
+    ├── gemma4_standalone/    # 完整案例：单文件实现 + 预处理 + KV cache + 生成 + 对齐测试
     └── run_gemma4_e2b.py     # 真实权重的前向 + loss + 对拍
 ```
 
@@ -201,7 +227,9 @@ hf-model-standalone/
 
 ## 不做什么
 
-- **不实现 KV cache / 生成循环。** 目标是 forward + loss，不是推理引擎
+- **不做生产级推理引擎。** KV cache 是"每层一对 tensor、沿 seq 维 append"的最小实现，
+  提供 prefill / decode / greedy+采样。没有静态预分配、beam search、量化 cache、CUDA graph ——
+  这些正好是留给读者的改造点，`kv_cache.py` 和 `generation.py` 末尾各列了一份清单
 - **不追求覆盖所有架构。** 每个模型都要重新走一遍流程；脚本是架构无关的，坑位清单是经验积累的
 - **不替代 `transformers`。** 它是生产环境该用的东西；这里产出的是**教学和改造用的副本**
 

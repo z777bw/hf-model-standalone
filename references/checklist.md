@@ -61,7 +61,20 @@
 - [ ] **`inv_freq` 这类"必须保持 fp32"的量没有注册成 buffer**（否则 `.to(bf16)` 会舍入它）
 - [ ] 加载后打印 `missing` / `unexpected` / `dropped` 三个列表
 
-## 6. 验证
+## 6. KV cache 与生成
+
+- [ ] cache 只由**非共享层**写入；共享层从 `shared_kv_states` 读（它们没有 `k_proj/v_proj`）
+- [ ] `store_full_length_kv` 的写入发生在 `cache.update()` **之后**（否则共享层拿半截历史）
+- [ ] decode 时 q 的绝对位置是 `kv_len - q_len`，mask 里带偏移
+- [ ] `position_ids = arange(seq_len) + past_seen`
+- [ ] `attention_mask` 覆盖**全长**（`past + new`），不是只传新 token
+- [ ] decode 阶段不重跑视觉/音频塔
+- [ ] 验证：同一实现 `use_cache=True` vs `False` 的整段前向 → **逐位相同**
+- [ ] 验证：增量 decode 拼接 vs 一次全序列 forward → **1e-6 量级**（不是 0，也不是 1e-2）
+- [ ] 验证：greedy 生成的 token ids 与参考实现完全一致
+- [ ] 序列长度要**超过 sliding window**，否则窗口裁剪那条路径根本没走到
+
+## 7. 验证
 
 - [ ] 两边 dtype 一致（`next(ref.parameters()).dtype` vs 自己的；参考默认吃 `config.dtype`）
 - [ ] `make_tiny_reference.py` 产出 tiny ckpt（架构开关全保留）
@@ -71,9 +84,10 @@
 - [ ] bf16 下再比一次（fp32 逐位相同 ≠ bf16 也相同，见 pitfalls B5）
 - [ ] 交付 README 里写清：覆盖范围、未覆盖范围、逐项 diff 表、已知参考实现问题
 
-## 7. 不要做的
+## 8. 不要做的
 
 - [ ] 不要重命名模块/参数（除非你愿意维护一层 key 映射）
 - [ ] 不要把 model 拆成十几个文件
 - [ ] 不要为了"看起来干净"去掉 buffer
 - [ ] 不要在没对齐单个 layer 之前就去调 logits 容差
+- [ ] 不要在 forward 没对齐之前先接 cache（同时面对两类 bug，没法定位）

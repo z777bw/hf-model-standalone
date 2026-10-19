@@ -45,6 +45,7 @@ from transformers import (  # noqa: E402
     Gemma4VisionConfig as HFVisionConfig,
 )
 
+from gemma4_standalone import generation as mine_gen  # noqa: E402
 from gemma4_standalone import modeling_gemma4 as mine  # noqa: E402
 from gemma4_standalone import preprocessing as mine_pre  # noqa: E402
 
@@ -349,6 +350,90 @@ def test_dtype_auto(hfmodel, cfg, ckpt_parent):
 
 
 # ---------------------------------------------------------------------------
+# incremental decoding / generation
+# ---------------------------------------------------------------------------
+def test_kv_cache(hfmodel, cfg, ckpt_parent, tag=""):
+    """Decode one token at a time and compare against a single full-sequence pass.
+
+    The sequence is 12 tokens, longer than the tiny `sliding_window` (8), so the
+    sliding masks really do have to clip the history mid-decode.  A wrong
+    q/kv offset or a broken shared-KV hand-off shows up here and nowhere else.
+    """
+    model, _ = mine.load_gemma4_from_safetensors(os.path.join(ckpt_parent, "model"), verbose=False)
+    model.eval()
+
+    ids = torch.tensor([[2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])
+    with torch.no_grad():
+        full = hfmodel(input_ids=ids).logits
+        # Same implementation, cache on vs off: isolates "does the cache change the
+        # math?" from "does decoding change the reduction order?" -- and from
+        # "eager vs sdpa kernel" (the port is always hand-written eager, so comparing
+        # against an sdpa reference here would measure the wrong thing).
+        uncached = model(input_ids=ids).logits
+        cached_full = model(input_ids=ids, use_cache=True).logits
+    d_prefill = float((uncached - cached_full).abs().max())
+    record(f"{tag}kv cache: cached prefill bit-exact", d_prefill == 0.0,
+           f"max_abs_diff={d_prefill:.3e}")
+
+    prefill_len = 5
+    with torch.no_grad():
+        out = model(input_ids=ids[:, :prefill_len], use_cache=True)
+        cache = out.past_key_values
+        chunks = [out.logits[:, -1:]]
+        mask = torch.ones((1, prefill_len), dtype=torch.long)
+        for t in range(prefill_len, ids.shape[1]):
+            mask = torch.cat([mask, mask.new_ones((1, 1))], dim=-1)
+            out = model(
+                input_ids=ids[:, t:t + 1], attention_mask=mask,
+                past_key_values=cache, use_cache=True,
+            )
+            chunks.append(out.logits[:, -1:])
+
+    inc = torch.cat(chunks, dim=1)                    # (1, T - prefill_len + 1, V)
+    ref = full[:, prefill_len - 1:]                   # predictions for tokens prefill..T-1
+    diff = float((ref - inc).abs().max())
+    # Mathematically identical, but not bit-identical: the softmax normaliser sums
+    # 6 terms in one pass and 12 in the other, and matmul sees a different batch
+    # shape, so the reduction order changes. ~1e-6 in fp32 is arithmetic noise.
+    # A real off-by-one in the q/kv offset or a broken shared-KV hand-off lands
+    # at 1e-2 or worse, so the two are easy to tell apart.
+    record(f"{tag}kv cache: incremental == full forward", diff < 1e-5, f"max_abs_diff={diff:.3e}")
+
+    record(f"{tag}kv cache: seq length", cache.get_seq_length() == ids.shape[1],
+           f"{cache.get_seq_length()} vs {ids.shape[1]}")
+
+    layers = model.model.language_model.layers
+    shared = [i for i, layer in enumerate(layers) if layer.self_attn.is_kv_shared_layer]
+    record(f"{tag}kv cache: shared layers store nothing",
+           all(cache.key_cache[i] is None for i in shared), f"shared={shared}")
+    record(f"{tag}kv cache: non-shared layers filled",
+           all(cache.key_cache[i] is not None for i in range(len(layers)) if i not in shared))
+
+
+def test_generation(hfmodel, cfg, ckpt_parent, tag=""):
+    """Greedy decoding must yield the same ids as transformers' `generate`."""
+    model, _ = mine.load_gemma4_from_safetensors(os.path.join(ckpt_parent, "model"), verbose=False)
+    model.eval()
+
+    prompt = torch.tensor([[2, 5, 6, 7]])
+    n_new = 6
+    # an eos id that essentially never wins, so both sides run the full 6 steps
+    eos = cfg.text_config.vocab_size - 1
+
+    ours = mine_gen.generate(
+        model, prompt, max_new_tokens=n_new, do_sample=False,
+        eos_token_id=eos, pad_token_id=0,
+    )
+    with torch.no_grad():
+        ref = hfmodel.generate(
+            prompt, max_new_tokens=n_new, do_sample=False,
+            eos_token_id=eos, pad_token_id=0, use_cache=True,
+        )
+    record(f"{tag}generate: greedy ids match transformers", torch.equal(ours, ref),
+           f"ours={ours.tolist()[0][-n_new:]} ref={ref.tolist()[0][-n_new:]}")
+
+
+# ---------------------------------------------------------------------------
 def main():
     print(f"== preprocessing (tokenizer checkpoint: {CKPT_DIR}) ==")
     test_tokenizer()
@@ -373,9 +458,11 @@ def main():
         export_checkpoint(hfmodel, cfg, os.path.join(d, "model"))
         test_forward(hfmodel, cfg, d, img_in["pixel_values"], img_in["image_position_ids"],
                      n_image_tokens, audio_in, include_audio, tag)
+        test_kv_cache(hfmodel, cfg, d, tag)
         if impl == "eager":
             test_weight_loading(d)
             test_dtype_auto(hfmodel, cfg, d)
+            test_generation(hfmodel, cfg, d)
 
     ok = all(r[1] for r in RESULTS)
     print("\n" + "=" * 72)

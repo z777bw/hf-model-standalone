@@ -37,6 +37,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:  # imported as a package (normal case)
+    from .kv_cache import KVCache
+except ImportError:  # `python modeling_gemma4.py` from inside the folder
+    from kv_cache import KVCache
+
 __all__ = [
     "Gemma4Config",
     "Gemma4TextConfig",
@@ -409,7 +414,8 @@ class Gemma4TextAttention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
 
-    def forward(self, hidden_states, position_embeddings, attention_mask, shared_kv_states):
+    def forward(self, hidden_states, position_embeddings, attention_mask, shared_kv_states,
+                past_key_values: KVCache | None = None):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings
@@ -418,6 +424,10 @@ class Gemma4TextAttention(nn.Module):
         query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
 
         if self.is_kv_shared_layer:
+            # No k_proj/v_proj here: reuse the k/v produced earlier by the layer that
+            # owns this layer type.  We read `shared_kv_states` rather than the cache
+            # because a sliding layer's cache may not hold the full history it needs
+            # (see kv_cache.py, `crop`).
             key_states, value_states = shared_kv_states[self.layer_type]
             key_states = key_states.to(query_states.device)
             value_states = value_states.to(query_states.device)
@@ -428,7 +438,16 @@ class Gemma4TextAttention(nn.Module):
             key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
             value_states = self.v_norm(value_states).transpose(1, 2)
 
+            if past_key_values is not None:
+                # Append the new positions; get back the whole history, which may be
+                # longer than `hidden_states` (prefill) or longer than 1 (decode).
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx
+                )
+
         if self.store_full_length_kv:
+            # Written *after* the cache update on purpose: shared layers downstream
+            # need the full history, not just this chunk.
             shared_kv_states[self.layer_type] = (key_states, value_states)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -542,7 +561,8 @@ class Gemma4TextDecoderLayer(nn.Module):
             self.post_feedforward_layernorm_2 = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.pre_feedforward_layernorm_2 = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, hidden_states, per_layer_input, shared_kv_states, position_embeddings, attention_mask):
+    def forward(self, hidden_states, per_layer_input, shared_kv_states, position_embeddings,
+                attention_mask, past_key_values: KVCache | None = None):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -550,6 +570,7 @@ class Gemma4TextDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             shared_kv_states=shared_kv_states,
+            past_key_values=past_key_values,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -589,8 +610,12 @@ def build_causal_mask(batch_size, q_len, kv_len, dtype, device, sliding_window=N
     """Additive 0/-min mask, shape (B, 1, q_len, kv_len).
 
     bidirectional_blocks: (B, kv_len) int tensor; equal values attend bidirectionally.
+    During decode `q_len < kv_len`: the queries sit at the *end* of the cached
+    history, so their absolute positions are offset by `kv_len - q_len`.  Prefill
+    has `q_len == kv_len` and the offset is 0, so this is a no-op there.
     """
-    q_idx = torch.arange(q_len, device=device)[:, None]
+    q_offset = kv_len - q_len
+    q_idx = torch.arange(q_len, device=device)[:, None] + q_offset
     kv_idx = torch.arange(kv_len, device=device)[None, :]
     allowed = torch.ones((q_len, kv_len), dtype=torch.bool, device=device) if not is_causal else kv_idx <= q_idx
     if is_causal and bidirectional_blocks is not None:
@@ -643,6 +668,7 @@ def block_sequence_ids_for_mask(mm_token_type_ids: torch.Tensor, device) -> torc
 @dataclass
 class Gemma4TextModelOutput:
     last_hidden_state: torch.Tensor
+    past_key_values: KVCache | None = None
 
 
 class Gemma4TextModel(nn.Module):
@@ -694,7 +720,8 @@ class Gemma4TextModel(nn.Module):
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
     def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, per_layer_inputs=None,
-                position_ids=None, mm_token_type_ids=None):
+                position_ids=None, mm_token_type_ids=None, past_key_values: KVCache | None = None,
+                use_cache: bool = False):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("specify exactly one of input_ids / inputs_embeds")
         if input_ids is not None:
@@ -712,14 +739,28 @@ class Gemma4TextModel(nn.Module):
 
         batch_size, seq_len = inputs_embeds.shape[:2]
         device, dtype = inputs_embeds.device, inputs_embeds.dtype
+
+        if use_cache and past_key_values is None:
+            past_key_values = KVCache(len(self.layers))
+        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        kv_len = past_seen + seq_len
+
+        if attention_mask is not None and attention_mask.shape[-1] != kv_len:
+            raise ValueError(
+                f"attention_mask covers {attention_mask.shape[-1]} positions but this call needs "
+                f"{kv_len} ({past_seen} cached + {seq_len} new). During decode the mask must span the "
+                f"whole history, not just the new token."
+            )
+
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+            # Absolute positions: on decode the new token is *not* at index 0.
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0) + past_seen
 
         block_ids = None
         if self.config.use_bidirectional_attention == "vision" and mm_token_type_ids is not None:
             block_ids = block_sequence_ids_for_mask(mm_token_type_ids, device)
 
-        mask_kwargs = dict(batch_size=batch_size, q_len=seq_len, kv_len=seq_len, dtype=dtype,
+        mask_kwargs = dict(batch_size=batch_size, q_len=seq_len, kv_len=kv_len, dtype=dtype,
                            device=device, attention_mask=attention_mask)
         masks = {
             "full_attention": build_causal_mask(**mask_kwargs),
@@ -747,8 +788,12 @@ class Gemma4TextModel(nn.Module):
                 shared_kv_states=shared_kv_states,
                 position_embeddings=position_embeddings[self.config.layer_types[i]],
                 attention_mask=masks[self.config.layer_types[i]],
+                past_key_values=past_key_values,
             )
-        return Gemma4TextModelOutput(last_hidden_state=self.norm(hidden_states))
+        return Gemma4TextModelOutput(
+            last_hidden_state=self.norm(hidden_states),
+            past_key_values=past_key_values,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1269,6 +1314,7 @@ class Gemma4CausalLMOutput:
     image_hidden_states: torch.Tensor | None = None
     audio_hidden_states: torch.Tensor | None = None
     hidden_states: torch.Tensor | None = None
+    past_key_values: KVCache | None = None
 
 
 class Gemma4Model(nn.Module):
@@ -1320,7 +1366,8 @@ class Gemma4Model(nn.Module):
 
     def forward(self, input_ids=None, pixel_values=None, pixel_values_videos=None, input_features=None,
                 attention_mask=None, input_features_mask=None, position_ids=None, mm_token_type_ids=None,
-                inputs_embeds=None, image_position_ids=None, video_position_ids=None, per_layer_inputs=None):
+                inputs_embeds=None, image_position_ids=None, video_position_ids=None, per_layer_inputs=None,
+                past_key_values: KVCache | None = None, use_cache: bool = False):
         image_mask, video_mask, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds)
         multimodal_mask = image_mask | video_mask | audio_mask
 
@@ -1370,7 +1417,10 @@ class Gemma4Model(nn.Module):
             )
 
         if position_ids is None:
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = (
+                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0) + past_seen
+            )
 
         use_bidir_ids = None
         if self.config.text_config.use_bidirectional_attention == "vision" and mm_token_type_ids is not None:
@@ -1383,12 +1433,15 @@ class Gemma4Model(nn.Module):
             per_layer_inputs=per_layer_inputs,
             position_ids=position_ids,
             mm_token_type_ids=use_bidir_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
         return Gemma4CausalLMOutput(
             logits=None,
             image_hidden_states=image_features,
             audio_hidden_states=audio_features,
             hidden_states=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
         )
 
 
@@ -1412,7 +1465,8 @@ class Gemma4ForConditionalGeneration(nn.Module):
     def forward(self, input_ids=None, pixel_values=None, pixel_values_videos=None, input_features=None,
                 attention_mask=None, input_features_mask=None, position_ids=None, image_position_ids=None,
                 video_position_ids=None, mm_token_type_ids=None, inputs_embeds=None, labels=None,
-                logits_to_keep: int = 0, per_layer_inputs=None):
+                logits_to_keep: int = 0, per_layer_inputs=None,
+                past_key_values: KVCache | None = None, use_cache: bool = False):
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -1426,6 +1480,8 @@ class Gemma4ForConditionalGeneration(nn.Module):
             image_position_ids=image_position_ids,
             video_position_ids=video_position_ids,
             per_layer_inputs=per_layer_inputs,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
         hidden_states = outputs.hidden_states
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1445,6 +1501,7 @@ class Gemma4ForConditionalGeneration(nn.Module):
             image_hidden_states=outputs.image_hidden_states,
             audio_hidden_states=outputs.audio_hidden_states,
             hidden_states=hidden_states,
+            past_key_values=outputs.past_key_values,
         )
 
     @staticmethod

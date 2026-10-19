@@ -3,10 +3,19 @@
     modeling_gemma4.py   every nn.Module, the config tree, the loss and the
                          safetensors weight loader (single file, by design)
     preprocessing.py     tokenizer / image processor / audio feature extractor
+    kv_cache.py          minimal per-layer K/V store for incremental decoding
+    generation.py        prefill / decode_step / generate
 
 See README.md in this folder and the `hf-model-standalone` skill for the method.
 """
 
+from .generation import (  # noqa: F401
+    decode_step,
+    generate,
+    prefill,
+    sample,
+)
+from .kv_cache import KVCache  # noqa: F401
 from .modeling_gemma4 import (  # noqa: F401
     Gemma4AudioConfig,
     Gemma4Config,
@@ -33,4 +42,9 @@ __all__ = [
     "Gemma4ImageProcessor",
     "Gemma4FeatureExtractor",
     "Gemma4Processor",
+    "KVCache",
+    "prefill",
+    "decode_step",
+    "generate",
+    "sample",
 ]

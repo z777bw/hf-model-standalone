@@ -1,12 +1,12 @@
 ---
 name: hf-model-standalone
-description: 把一个 HuggingFace 模型从 transformers 里"抽"成不依赖 transformers 的纯 PyTorch 实现——含 tokenizer/图像/音频预处理、权重加载、forward 与 loss，并用 tiny 随机权重做逐层数值对齐。当用户说"脱离 transformers 跑某个模型/自己实现某模型的 forward/loss/推理"、"把模型代码抽出来、去依赖、单文件化"、"不用 transformers 加载 hf 权重"、"复现某模型的预处理"时使用。
+description: 把一个 HuggingFace 模型从 transformers 里"抽"成不依赖 transformers 的纯 PyTorch 实现——含 tokenizer/图像/音频预处理、权重加载、forward 与 loss、KV cache 增量解码与生成循环，并用 tiny 随机权重做逐层数值对齐。当用户说"脱离 transformers 跑某个模型/自己实现某模型的 forward/loss/推理"、"把模型代码抽出来、去依赖、单文件化"、"不用 transformers 加载 hf 权重"、"实现 KV cache / 增量解码 / 生成循环"、"复现某模型的预处理"时使用。
 ---
 
 # 从 transformers 抽出一个可独立运行的模型
 
 目标：给定 `org/model`，产出一份 `torch / numpy / pillow / tokenizers / safetensors` 就能跑的实现，
-forward、loss、权重加载全部自洽，并且**能和 transformers 的输出逐位对上**。
+forward、loss、权重加载、增量解码全部自洽，并且**能和 transformers 的输出对上**。
 
 ---
 
@@ -18,12 +18,12 @@ forward、loss、权重加载全部自洽，并且**能和 transformers 的输�
 |---|---|---|---|
 | 1 | `config.json` | 权重仓库根目录 | 架构的**唯一真相**。所有开关（层类型、head_dim、rope 参数、共享层、softcap、池化核）都在这里 |
 | 2 | 权重 key 树 | `model.safetensors` 的 **header**（不用下载） | 决定你的模块**命名**。照抄 key 就免费获得 `load_state_dict` 兼容 |
-| 3 | `modeling_*.py` 的 forward 链 | `site-packages/transformers/models/<arch>/` | 顺序、残差、norm 位置、mask 语义、dtype 处理 |
+| 3 | `modeling_*.py` 的 forward 链 | `site-packages/transformers/models/<model_type>/` | 顺序、残差、norm 位置、mask 语义、dtype 处理 |
 | 4 | `image_processing_*.py` / `feature_extraction_*.py` / `tokenizer.json` | 同上 + 仓库 | 预处理差 1e-3，模型输出就可能差 1e-1；而且它常**不按常理出牌**（aspect-ratio resize、直接 patchify、不做 normalize） |
 
 以及两个"隐形的第 5 处"：`configuration_utils` 的 `__post_init__`（派生态，如
 `layer_types` 默认 5:1、`per_layer_config` 的 head_dim 覆盖）和
-`masking_utils` 的 mask 语义（0 允许 / min 屏蔽、sliding 是 `k > q - w`）。
+`masking_utils` 的 `cache_position` / mask 语义（0 允许 / min 屏蔽、sliding 是 `k > q - w`）。
 
 > 经验：**模块树 / 参数名 100% 镜像参考实现**。不要"顺便美化"成 `self.layers[i].attn.qkv`，
 > 否则你得手写一套 key 映射，而 key 映射是最容易错、最难调的一层。
@@ -68,7 +68,9 @@ grep -n "^from\|^import" .../models/<arch>/modeling_<arch>.py   # 依赖面 = �
 
 ⑤ **数值对齐**（见第 3 节）。先对齐 embedding → 逐层 hidden → 最后才看 logits。
 
-⑥ 真实权重验证（在服务器上）：`report["missing"] == []`、`unexpected == []` 才算通。
+⑥ **增量解码**（见第 5 节）。forward 对齐之后再接 cache，顺序反了会同时面对两类 bug。
+
+⑦ 真实权重验证（在服务器上）：`report["missing"] == []`、`unexpected == []` 才算通。
 
 ---
 
@@ -76,7 +78,7 @@ grep -n "^from\|^import" .../models/<arch>/modeling_<arch>.py   # 依赖面 = �
 
 **A. 重写（推荐给"要读懂/要改"的场景）**
 参考实现只当规范读。优点是干净、可控、单文件；缺点是要逐行对照。
-Gemma 4 / 多模态模型基本只能走这条（依赖面太大：masking_utils、cache_utils、rope_utils、
+多模态模型基本只能走这条（依赖面太大：masking_utils、cache_utils、rope_utils、
 generation、integrations…）。
 
 **B. 搬运 + 打桩（推荐给"只是想去掉依赖"的场景）**
@@ -140,53 +142,89 @@ for shard in shards:                       # 单文件或 index.json 的 weight_
 
 ---
 
-## 5. 常见坑（Gemma 4 实测，全部踩过）
+## 5. KV cache 与生成循环
+
+`use_cache=False` 保持默认（纯前向，最容易和训练/对拍对齐）。要推理时再打开。
+三块分开，便于单独替换：
+
+| 文件 | 职责 |
+|---|---|
+| `kv_cache.py` | 每层一对 `(k, v)`；`update()` 沿 seq 维 append，返回完整历史；`crop()` / `reorder_cache()` 留作改造点 |
+| `modeling_*.py` | attention 里 `past_key_values.update(...)`，**只有非共享层写** |
+| `generation.py` | `prefill` → 循环 `decode_step` → `sample`，拼成 `generate` |
+
+### 四个必须处理的点
+
+**① mask 要做位置偏移。** decode 时 `q_len=1`、`kv_len=past+1`，query 的绝对位置是
+`kv_len - q_len`，不是 0。忘了这一步，sliding mask 会永远放行（或全屏蔽）——
+**短序列完全看不出来**。
+
+```python
+q_offset = kv_len - q_len
+q_idx = torch.arange(q_len)[:, None] + q_offset
+kv_idx = torch.arange(kv_len)[None, :]
+```
+
+**② KV 共享层不写 cache。** 它们没有 `k_proj/v_proj`，从 `shared_kv_states` 读。
+写入方是"该 `layer_type` 的最后一个非共享层"（`store_full_length_kv`），而且必须在
+`cache.update()` **之后**写，否则共享层拿到的是半截历史。
+
+**③ position_ids 与 attention_mask 都要跟着 cache 走。**
+`position_ids = arange(seq_len) + past_seen`；`attention_mask` 必须覆盖**全长**
+（`past + new`），只传新 token 会 shape 报错或在广播里静默串味。
+
+**④ decode 不要重跑视觉/音频塔。** 它们只在 prefill 出现。每步重算会吃掉全部时间预算，
+而且 soft token 已经进 cache 了，重算也不会改变结果。
+
+### 怎么验证
+
+| 检查 | 期望 | 说明 |
+| --- | --- | --- |
+| 同一实现 `use_cache=True` vs `False` 的整段前向 | **逐位相同（0.0）** | cache 读写不该改变数值 |
+| 增量 decode 拼接 vs 一次全序列 forward | **1e-6 量级，不是 0** | 见下 |
+| greedy 生成的 token ids vs 参考实现 | 完全一致 | 最贴近用户感受的一条 |
+
+第二项**不是 0 才是正常**：softmax 分母的求和项数不同（6 项 vs 12 项），matmul 的
+batch shape 也不同，归约顺序变了。把第一项单独测，就是为了区分"cache 写错了"和
+"归约顺序不同"——**1e-2 才是 bug**（位置偏移错、共享层取错层）。
+
+---
+
+## 6. 常见坑（移植时高频出现）
 
 | 坑 | 症状 | 处理 |
 |---|---|---|
 | **参考按 `config.dtype` 加载 bf16** | 第一层就有 1e-2 差异，逐层放大，fp32 下本该 0.0 | 参考显式传 `dtype=torch.float32`，或自己传 `dtype="auto"`；先看 `next(ref.parameters()).dtype` |
 | **`inv_freq` 注册成 buffer** | fp32 下 0.0，bf16 下第一层就差 1e-2；`cos` 逐位对、`sin` 差 1 ulp | `.to(bf16)` 会舍入所有浮点 buffer（`bf16(0.1)=0.10009765625`）。改成普通属性存 fp32，forward 里再 upcast |
-| `config.to_dict()` 丢掉 `global_head_dim` | tiny 配置里 full-attention 层 head_dim 变成默认 512 | 导出 tiny 配置后手动补 `text_config.global_head_dim` |
+| `config.to_dict()` 丢掉派生字段 | tiny 配置里 full-attention 层 head_dim 变成默认值 | 导出 tiny 配置后手动补回（`--set text_config.<field>=...`） |
 | `per_layer_config` 让 `config.head_dim` 抛异常 | `AmbiguousGlobalPerLayerAttributeError` | 用 `config.per_layer_config[i].head_dim`，或自己在 config 里写 `layer_head_dim(i)` |
-| eager 下音频 mask 语义反了 | 音频输出差 1e-1 且怎么调都不收敛 | 参考实现的 `Gemma4AudioAttention` 期望 bool mask，eager 给 float → 窗口内注意力退化为均匀。**对齐要用 sdpa** |
-| PLE 被投影两次 | 每层 hidden 差 1e-2，logits 差 5e-2 | 投影只在 text model 内部做一次，外层只传 raw token embedding |
+| eager 下音频 mask 语义反了 | 音频输出差 1e-1 且怎么调都不收敛 | 某些实现的 `masked_fill(mask.logical_not(), ...)` 期望 bool mask，eager 给 float → 退化为均匀注意力。**对齐时换 `attn_implementation` 试** |
+| 同一份 embedding 被投影两次 | 每层 hidden 差 1e-2，logits 差 5e-2 | 投影只在内层做一次，外层只传 raw embedding |
 | 左 padding 的 loss | loss 差 3e-2，logits 只在有效位对上 | 第一个真实 token 由"全屏蔽行"预测，label 要一起忽略 |
-| 位置表 buffer 初始化成 `ones` | 不报错，但输出不对 | `position_embedding_table` 初值是 1 不是 0/正态 |
+| 位置表 buffer 初始化成 `ones` | 不报错，但输出不对 | 先查 `__init__` 的初值，别随手 `torch.empty` |
 | sliding window 边界 | 只在长序列时错 | 语义是 `kv_idx > q_idx - w`（含自身，窗口宽 w） |
-| 视觉 patch 顺序 | 图看起来对但差 1e-2 | reshape 顺序 `(C,ph,P,pw,P)->(ph,pw,P,P,C)`，别用 unfold 的默认序 |
+| **decode 时 mask 没做位置偏移** | 短序列正常，超过窗口就全乱 | q 的绝对位置是 `kv_len - q_len`，不是 0 |
+| **共享层读到半截 k/v** | 只有解码长度超过 prefill 时才错 | `store_full_length_kv` 必须在 `cache.update()` 之后写 |
+| 视觉 patch 顺序 | 图看起来对但差 1e-2 | patch 内通道放最后一维，与 `Linear(C*P*P, hidden)` 对应 |
 
 完整清单：`references/pitfalls.md`。
 
 ---
 
-## 6. 交付物组织
+## 7. 交付物组织
 
 ```
 <model>_standalone/
 ├── modeling_<arch>.py    # 单文件：config + 所有 nn.Module + forward/loss + 权重加载
 ├── preprocessing.py      # tokenizer / image / audio / processor 拼装
+├── kv_cache.py           # 增量解码：最小 K/V 存储（可替换为 static / quantized）
+├── generation.py         # prefill / decode_step / generate
 ├── README.md             # 覆盖范围 + 未覆盖范围 + 实测 diff 表
-└── tests/test_parity.py  # tiny 参考模型对齐
+└── tests/test_parity.py  # tiny 参考模型对齐 + cache 一致性
 ```
 
 模型代码坚持一个文件：多模态模型动辄 3000 行，拆成 20 个模块后"和参考实现对拍"会变成
-在 20 个文件间跳转，成本远大于单文件的阅读成本。
+在 20 个文件间跳转，成本远大于单文件的阅读成本。`kv_cache.py` 与 `generation.py` 单独成文
+是例外——它们是**要被替换**的部分，和"读懂模型"是两件事。
 
-逐项打勾的执行清单见 `references/checklist.md`（配置 → 模块树 → 预处理 → 权重 → 对齐 → 交付）。
-
----
-
-## 7. 参考案例
-
-`examples/gemma4_standalone/`（google/gemma-4-E2B，5.1B，文本 + 视觉 + 音频）
-
-- `modeling_gemma4.py`：1575 行单文件实现，运行时不 import transformers
-- `preprocessing.py`：tokenizer / 图像切 patch / 音频 log-mel / processor 拼装
-- `test_parity.py`：35 项检查全过，文本与视觉在 fp32 下**逐位相同（0.0）**
-
-它包含三个参考实现自身的坑（`global_head_dim` 被 `per_layer_config` 吞掉、eager 音频 mask
-类型、`inv_freq` 被 bf16 舍入），以及"dtype 不一致导致 1e-2 假差异"的完整排查过程，
-都记录在 `references/pitfalls.md`。改造新模型时，先照着这份案例的目录结构摆。
-
-> 若这个 skill 是单独安装的、没有 `examples/` 目录（例如只拷了 `SKILL.md` + `references/`
-> + `scripts/`），按第 1~5 节自己造一个案例即可；案例不是运行依赖，只是参照物。
+逐项打勾的执行清单见 `references/checklist.md`（配置 → 模块树 → 预处理 → 权重 → 对齐 → cache → 交付）。
